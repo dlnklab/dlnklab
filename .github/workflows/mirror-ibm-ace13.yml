@@ -1,0 +1,146 @@
+name: Copiar IBM ACE 13 a GHCR
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: mirror-ibm-ace-ghcr
+  cancel-in-progress: false
+
+env:
+  SOURCE_IMAGE: cp.icr.io/cp/appc/ace@sha256:1d09b4cfe663ab86e85b1faa33e85ce65ec842a6a7b044667c031ae537b47b65
+  SOURCE_DIGEST: sha256:1d09b4cfe663ab86e85b1faa33e85ce65ec842a6a7b044667c031ae537b47b65
+  DESTINATION_IMAGE: ghcr.io/dlnklab/ace:13.0.9.0-r1
+
+jobs:
+  copy:
+    name: ACE 13.0.9.0-r1 / Linux AMD64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Instalar Skopeo
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends skopeo
+
+      - name: Rechazar un destino con acceso público
+        id: privacy
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from urllib.error import HTTPError
+          from urllib.request import Request, urlopen
+
+          def main():
+              token_url = "https://ghcr.io/token?service=ghcr.io&scope=repository:dlnklab/ace:pull"
+              try:
+                  with urlopen(token_url, timeout=30) as response:
+                      token = json.load(response)["token"]
+                  if not token:
+                      raise ValueError("GHCR no devolvió un token válido.")
+              except HTTPError as error:
+                  if error.code in (401, 403, 404):
+                      print("GHCR no permite obtener acceso anónimo al destino.")
+                      return
+                  raise
+              request = Request(
+                  "https://ghcr.io/v2/dlnklab/ace/tags/list",
+                  headers={"Authorization": "Bearer " + token},
+              )
+              try:
+                  with urlopen(request, timeout=30):
+                      pass
+              except HTTPError as error:
+                  if error.code in (401, 403, 404):
+                      print("El destino no permite consultar etiquetas anónimamente.")
+                      return
+                  raise
+              raise SystemExit("El destino GHCR es público. No se publicará una imagen IBM.")
+
+          main()
+          PY
+
+      - name: Autenticar registros sin imprimir credenciales
+        env:
+          IBM_ENTITLEMENT_KEY: ${{ secrets.IBM_ENTITLEMENT_KEY }}
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 077
+          : "${IBM_ENTITLEMENT_KEY:?Falta el secreto IBM_ENTITLEMENT_KEY.}"
+          printf '%s' "$IBM_ENTITLEMENT_KEY" | skopeo login \
+            --authfile "$RUNNER_TEMP/ace-registry-auth.json" \
+            --username cp --password-stdin cp.icr.io
+          printf '%s' "$GHCR_TOKEN" | skopeo login \
+            --authfile "$RUNNER_TEMP/ace-registry-auth.json" \
+            --username "$GITHUB_ACTOR" --password-stdin ghcr.io
+
+      - name: Validar acceso y proteger la etiqueta existente
+        run: |
+          set -euo pipefail
+          authfile="$RUNNER_TEMP/ace-registry-auth.json"
+          # GHCR crea paquetes nuevos con visibilidad privada por defecto.
+          # Solo se acepta ausencia explícita; los demás fallos de acceso detienen la copia.
+          if ! skopeo list-tags --authfile "$authfile" docker://ghcr.io/dlnklab/ace \
+            > "$RUNNER_TEMP/ace-destination-tags.json" 2> "$RUNNER_TEMP/ace-tags-error.txt"; then
+            if grep -Eiq 'name unknown|NAME_UNKNOWN' "$RUNNER_TEMP/ace-tags-error.txt"; then
+              echo "El paquete aún no existe o no es visible. Se intentará la publicación privada con packages: write."
+            else
+              cat "$RUNNER_TEMP/ace-tags-error.txt"
+              echo "::error::No se pudo comprobar el destino. Revise el acceso Write de dlnklab/dlnklab en Manage Actions access."
+              exit 1
+            fi
+          fi
+          if skopeo inspect --raw --authfile "$authfile" "docker://$DESTINATION_IMAGE" \
+            > "$RUNNER_TEMP/ace-existing-manifest.json" 2> "$RUNNER_TEMP/ace-inspect-error.txt"; then
+            current_digest=$(skopeo manifest-digest "$RUNNER_TEMP/ace-existing-manifest.json")
+            if [[ "$current_digest" != "$SOURCE_DIGEST" ]]; then
+              echo "::error::La etiqueta de destino ya contiene otro manifiesto. No se sobrescribirá."
+              exit 1
+            fi
+          elif ! grep -Eiq 'manifest unknown|name unknown|MANIFEST_UNKNOWN|NAME_UNKNOWN' \
+            "$RUNNER_TEMP/ace-inspect-error.txt"; then
+            cat "$RUNNER_TEMP/ace-inspect-error.txt"
+            exit 1
+          fi
+
+      - name: Copiar entre registros y verificar el digest
+        run: |
+          set -euo pipefail
+          if ! skopeo copy --preserve-digests --retry-times 3 \
+            --src-authfile "$RUNNER_TEMP/ace-registry-auth.json" \
+            --dest-authfile "$RUNNER_TEMP/ace-registry-auth.json" \
+            "docker://$SOURCE_IMAGE" "docker://$DESTINATION_IMAGE"; then
+            echo "::error::Falló la copia. Revise el error anterior, el acceso IBM y Write en Manage Actions access del paquete GHCR."
+            exit 1
+          fi
+          skopeo inspect --raw --authfile "$RUNNER_TEMP/ace-registry-auth.json" \
+            "docker://$DESTINATION_IMAGE" > "$RUNNER_TEMP/ace-published-manifest.json"
+          published_digest=$(skopeo manifest-digest "$RUNNER_TEMP/ace-published-manifest.json")
+          if [[ "$published_digest" != "$SOURCE_DIGEST" ]]; then
+            echo "::error::El digest publicado no coincide con el origen fijado."
+            exit 1
+          fi
+          {
+            echo '## Imagen verificada'
+            printf '\n- Destino: `%s`\n' "$DESTINATION_IMAGE"
+            printf -- '- Plataforma: Linux AMD64\n- Digest: `%s`\n' "$published_digest"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Retirar credenciales temporales del runner
+        if: ${{ always() }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          (Path(os.environ["RUNNER_TEMP"]) / "ace-registry-auth.json").unlink(missing_ok=True)
+          PY
