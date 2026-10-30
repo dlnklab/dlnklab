@@ -2,6 +2,11 @@ name: Copiar IBM ACE a GHCR
 
 on:
   workflow_dispatch:
+    inputs:
+      ace_version:
+        description: "Versión ACE publicada por IBM, por ejemplo 13.0.9.0-r1"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -12,19 +17,27 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SOURCE_IMAGE: cp.icr.io/cp/appc/ace@sha256:5337e051717977d82d6bc6826b4749a00f9957a9b454d83b36c56868fcb183fb
-  SOURCE_DIGEST: sha256:5337e051717977d82d6bc6826b4749a00f9957a9b454d83b36c56868fcb183fb
-  DESTINATION_IMAGE: ghcr.io/dlnklab/ace:12.0.12.30-r1
+  ACE_VERSION: ${{ inputs.ace_version }}
+  SOURCE_REPOSITORY: cp.icr.io/cp/appc/ace
+  DESTINATION_REPOSITORY: ghcr.io/dlnklab/ace
 
 jobs:
   copy:
-    name: ACE 12.0.12.30-r1 / Linux AMD64
+    name: ACE ${{ inputs.ace_version }} / Linux AMD64
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     defaults:
       run:
         shell: bash
     steps:
+      - name: Validar la versión solicitada
+        run: |
+          set -euo pipefail
+          if [[ ! "$ACE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+-r[0-9]+$ ]]; then
+            echo "::error::La versión no tiene el formato esperado, por ejemplo 13.0.9.0-r1."
+            exit 1
+          fi
+
       - name: Instalar Skopeo
         run: |
           set -euo pipefail
@@ -84,13 +97,30 @@ jobs:
             --authfile "$RUNNER_TEMP/ace-registry-auth.json" \
             --username "$GITHUB_ACTOR" --password-stdin ghcr.io
 
-      - name: Validar acceso y proteger la etiqueta existente
+      - name: Resolver el digest de origen
+        id: source
         run: |
           set -euo pipefail
           authfile="$RUNNER_TEMP/ace-registry-auth.json"
+          source_reference="$SOURCE_REPOSITORY:$ACE_VERSION"
+          if ! skopeo inspect --raw --authfile "$authfile" "docker://$source_reference" \
+            > "$RUNNER_TEMP/ace-source-manifest.json"; then
+            echo "::error::No se pudo resolver la versión en el registro de IBM."
+            exit 1
+          fi
+          source_digest=$(skopeo manifest-digest "$RUNNER_TEMP/ace-source-manifest.json")
+          printf 'source_digest=%s\n' "$source_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Validar acceso y proteger la etiqueta existente
+        env:
+          SOURCE_DIGEST: ${{ steps.source.outputs.source_digest }}
+        run: |
+          set -euo pipefail
+          authfile="$RUNNER_TEMP/ace-registry-auth.json"
+          destination_image="$DESTINATION_REPOSITORY:$ACE_VERSION"
           # GHCR crea paquetes nuevos con visibilidad privada por defecto.
           # Solo se acepta ausencia explícita; los demás fallos de acceso detienen la copia.
-          if ! skopeo list-tags --authfile "$authfile" docker://ghcr.io/dlnklab/ace \
+          if ! skopeo list-tags --authfile "$authfile" "docker://$DESTINATION_REPOSITORY" \
             > "$RUNNER_TEMP/ace-destination-tags.json" 2> "$RUNNER_TEMP/ace-tags-error.txt"; then
             if grep -Eiq 'name unknown|NAME_UNKNOWN' "$RUNNER_TEMP/ace-tags-error.txt"; then
               echo "El paquete aún no existe o no es visible. Se intentará la publicación privada con packages: write."
@@ -100,7 +130,7 @@ jobs:
               exit 1
             fi
           fi
-          if skopeo inspect --raw --authfile "$authfile" "docker://$DESTINATION_IMAGE" \
+          if skopeo inspect --raw --authfile "$authfile" "docker://$destination_image" \
             > "$RUNNER_TEMP/ace-existing-manifest.json" 2> "$RUNNER_TEMP/ace-inspect-error.txt"; then
             current_digest=$(skopeo manifest-digest "$RUNNER_TEMP/ace-existing-manifest.json")
             if [[ "$current_digest" != "$SOURCE_DIGEST" ]]; then
@@ -114,26 +144,30 @@ jobs:
           fi
 
       - name: Copiar entre registros y verificar el digest
+        env:
+          SOURCE_DIGEST: ${{ steps.source.outputs.source_digest }}
         run: |
           set -euo pipefail
+          authfile="$RUNNER_TEMP/ace-registry-auth.json"
+          destination_image="$DESTINATION_REPOSITORY:$ACE_VERSION"
           if ! skopeo copy --preserve-digests --retry-times 3 \
-            --src-authfile "$RUNNER_TEMP/ace-registry-auth.json" \
-            --dest-authfile "$RUNNER_TEMP/ace-registry-auth.json" \
-            "docker://$SOURCE_IMAGE" "docker://$DESTINATION_IMAGE"; then
+            --src-authfile "$authfile" \
+            --dest-authfile "$authfile" \
+            "docker://$SOURCE_REPOSITORY@$SOURCE_DIGEST" "docker://$destination_image"; then
             echo "::error::Falló la copia. Revise el error anterior, el acceso IBM y Write en Manage Actions access del paquete GHCR."
             exit 1
           fi
-          skopeo inspect --raw --authfile "$RUNNER_TEMP/ace-registry-auth.json" \
-            "docker://$DESTINATION_IMAGE" > "$RUNNER_TEMP/ace-published-manifest.json"
+          skopeo inspect --raw --authfile "$authfile" \
+            "docker://$destination_image" > "$RUNNER_TEMP/ace-published-manifest.json"
           published_digest=$(skopeo manifest-digest "$RUNNER_TEMP/ace-published-manifest.json")
           if [[ "$published_digest" != "$SOURCE_DIGEST" ]]; then
-            echo "::error::El digest publicado no coincide con el origen fijado."
+            echo "::error::El digest publicado no coincide con el origen resuelto."
             exit 1
           fi
           {
             echo '## Imagen verificada'
-            printf '\n- Destino: `%s`\n' "$DESTINATION_IMAGE"
-            printf -- '- Plataforma: Linux AMD64\n- Digest: `%s`\n' "$published_digest"
+            printf '\n- Destino: `%s`\n' "$destination_image"
+            printf -- '- Versión IBM: `%s`\n- Digest: `%s`\n' "$ACE_VERSION" "$published_digest"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Retirar credenciales temporales del runner
