@@ -102,13 +102,39 @@ jobs:
         run: |
           set -euo pipefail
           authfile="$RUNNER_TEMP/ace-registry-auth.json"
+          manifest="$RUNNER_TEMP/ace-source-manifest.json"
           source_reference="$SOURCE_REPOSITORY:$ACE_VERSION"
-          if ! skopeo inspect --raw --authfile "$authfile" "docker://$source_reference" \
-            > "$RUNNER_TEMP/ace-source-manifest.json"; then
+          if ! skopeo inspect --raw --authfile "$authfile" "docker://$source_reference" > "$manifest"; then
             echo "::error::No se pudo resolver la versión en el registro de IBM."
             exit 1
           fi
-          source_digest=$(skopeo manifest-digest "$RUNNER_TEMP/ace-source-manifest.json")
+          # Se copia solo linux/amd64. Si el origen es un índice multiarquitectura,
+          # se selecciona el digest de ese manifiesto; si es un manifiesto único, se usa el suyo.
+          source_digest=$(python3 - "$manifest" <<'PY'
+          import hashlib, json, re, sys
+          from pathlib import Path
+
+          raw = Path(sys.argv[1]).read_bytes()
+          document = json.loads(raw)
+          manifests = document.get("manifests")
+          if manifests is None:
+              digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+          else:
+              candidates = [
+                  entry.get("digest")
+                  for entry in manifests
+                  if entry.get("platform", {}).get("os") == "linux"
+                  and entry.get("platform", {}).get("architecture") == "amd64"
+              ]
+              candidates = [value for value in candidates if isinstance(value, str)]
+              if len(candidates) != 1:
+                  raise SystemExit("El índice de origen no contiene exactamente un manifiesto linux/amd64.")
+              digest = candidates[0]
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest or ""):
+              raise SystemExit("El digest resuelto no tiene el formato esperado.")
+          print(digest)
+          PY
+          )
           printf 'source_digest=%s\n' "$source_digest" >> "$GITHUB_OUTPUT"
 
       - name: Validar acceso y proteger la etiqueta existente
@@ -134,7 +160,7 @@ jobs:
             > "$RUNNER_TEMP/ace-existing-manifest.json" 2> "$RUNNER_TEMP/ace-inspect-error.txt"; then
             current_digest=$(skopeo manifest-digest "$RUNNER_TEMP/ace-existing-manifest.json")
             if [[ "$current_digest" != "$SOURCE_DIGEST" ]]; then
-              echo "::error::La etiqueta de destino ya contiene otro manifiesto. No se sobrescribirá."
+              echo "::error::La etiqueta de destino ya contiene otro manifiesto ($current_digest != $SOURCE_DIGEST). No se sobrescribirá."
               exit 1
             fi
           elif ! grep -Eiq 'manifest unknown|name unknown|MANIFEST_UNKNOWN|NAME_UNKNOWN' \
