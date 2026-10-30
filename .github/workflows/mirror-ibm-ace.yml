@@ -88,11 +88,17 @@ jobs:
         run: |
           set -euo pipefail
           authfile="$RUNNER_TEMP/ace-registry-auth.json"
-          # Requiere un paquete privado existente para no crear otro con permisos inesperados.
+          # GHCR crea paquetes nuevos con visibilidad privada por defecto.
+          # Solo se acepta ausencia explícita; los demás fallos de acceso detienen la copia.
           if ! skopeo list-tags --authfile "$authfile" docker://ghcr.io/dlnklab/ace \
-            > "$RUNNER_TEMP/ace-destination-tags.json"; then
-            echo "::error::Se requiere el paquete privado ace y acceso Write de dlnklab/dlnklab en Manage Actions access."
-            exit 1
+            > "$RUNNER_TEMP/ace-destination-tags.json" 2> "$RUNNER_TEMP/ace-tags-error.txt"; then
+            if grep -Eiq 'name unknown|NAME_UNKNOWN' "$RUNNER_TEMP/ace-tags-error.txt"; then
+              echo "El paquete aún no existe o no es visible. Se intentará la publicación privada con packages: write."
+            else
+              cat "$RUNNER_TEMP/ace-tags-error.txt"
+              echo "::error::No se pudo comprobar el destino. Revise el acceso Write de dlnklab/dlnklab en Manage Actions access."
+              exit 1
+            fi
           fi
           if skopeo inspect --raw --authfile "$authfile" "docker://$DESTINATION_IMAGE" \
             > "$RUNNER_TEMP/ace-existing-manifest.json" 2> "$RUNNER_TEMP/ace-inspect-error.txt"; then
